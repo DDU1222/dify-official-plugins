@@ -161,6 +161,19 @@ class AihubmixOpenAIResponses:
         - ("reasoning_end", {}) when reasoning ends
         - ("delta", {"text": str}) for incremental output text
         - ("final", {"response": Response, "text": str}) at completion
+        
+        GPT-5 Responses API SSE 事件类型：
+        - response.output_item.added: 添加输出项 (type=reasoning 或 type=message)
+        - response.reasoning_summary_part.added: 开始思考摘要
+        - response.reasoning_summary_text.delta: 思考摘要增量文本
+        - response.reasoning_summary_text.done: 思考摘要完成
+        - response.reasoning_summary_part.done: 思考摘要部分完成
+        - response.output_item.done: 输出项完成
+        - response.content_part.added: 开始内容部分
+        - response.output_text.delta: 输出文本增量
+        - response.output_text.done: 输出文本完成
+        - response.content_part.done: 内容部分完成
+        - response.completed: 响应完成
         """
         params = self._prepare_params(model_parameters, user)
         final_input = self._convert_messages_to_responses_input(prompt_messages)
@@ -177,8 +190,32 @@ class AihubmixOpenAIResponses:
             for event in stream:
                 etype = getattr(event, "type", None)
                 
-                # 处理思考内容事件
-                if etype == "response.reasoning_content.delta":
+                # 处理思考摘要开始事件
+                if etype == "response.reasoning_summary_part.added":
+                    if not is_reasoning:
+                        is_reasoning = True
+                        yield ("reasoning_start", {})
+                
+                # 处理思考摘要增量事件 (GPT-5 系列使用这个事件类型)
+                elif etype == "response.reasoning_summary_text.delta":
+                    delta_text = getattr(event, "delta", "") or ""
+                    if delta_text:
+                        if not is_reasoning:
+                            is_reasoning = True
+                            yield ("reasoning_start", {})
+                        yield ("reasoning_delta", {"text": delta_text})
+                
+                # 处理思考摘要完成事件
+                elif etype == "response.reasoning_summary_text.done":
+                    # 不在这里结束思考，等待 output_text.delta 或 response.completed
+                    pass
+                
+                elif etype == "response.reasoning_summary_part.done":
+                    # 思考摘要部分完成，但不立即结束思考状态
+                    pass
+                
+                # 处理旧版思考内容事件 (兼容性)
+                elif etype == "response.reasoning_content.delta":
                     delta_text = getattr(event, "delta", "") or ""
                     if delta_text:
                         if not is_reasoning:
@@ -191,7 +228,7 @@ class AihubmixOpenAIResponses:
                         is_reasoning = False
                         yield ("reasoning_end", {})
                 
-                # 处理加密思考内容事件 (reasoning.encrypted_content)
+                # 处理加密思考内容事件 (兼容性)
                 elif etype == "response.reasoning.delta":
                     delta_text = getattr(event, "delta", "") or ""
                     if delta_text:
@@ -205,6 +242,7 @@ class AihubmixOpenAIResponses:
                         is_reasoning = False
                         yield ("reasoning_end", {})
                 
+                # 处理输出文本增量事件
                 elif etype == "response.output_text.delta":
                     # 如果还在思考状态，先结束思考
                     if is_reasoning:
