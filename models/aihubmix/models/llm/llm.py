@@ -1,6 +1,11 @@
+import codecs
 import logging
 from collections.abc import Generator
 from typing import Optional, Union, Any, cast
+
+import requests
+from pydantic import TypeAdapter, ValidationError
+
 from dify_plugin.entities.model import AIModelEntity
 from dify_plugin.entities.model.llm import LLMResult, LLMResultChunk, LLMResultChunkDelta
 from dify_plugin.entities.model.message import PromptMessage, PromptMessageTool, AssistantPromptMessage
@@ -17,6 +22,7 @@ from dify_plugin.errors.model import (
     InvokeRateLimitError,
     InvokeServerUnavailableError,
 )
+from dify_plugin.interfaces.model.openai_compatible.llm import _increase_tool_call
 from .anthropic import AnthropicLargeLanguageModel
 from .google import GoogleLargeLanguageModel
 from .openai_response import AihubmixOpenAIResponses
@@ -29,7 +35,8 @@ logger = logging.getLogger(__name__)
 
 # thinking models compatibility for max_completion_tokens (all starting with "o" or "gpt-5")
 THINKING_SERIES_COMPATIBILITY = ("o", "gpt-5")
-RESPONSE_SERIES_COMPATIBILITY = ("gpt-5-codex", "gpt-5-pro", "o3-pro")
+# GPT-5 系列和 o3-pro 使用 Responses API
+RESPONSE_SERIES_COMPATIBILITY = ("gpt-5", "o3-pro")
 
 
 class AihubmixLargeLanguageModel(OAICompatLargeLanguageModel):
@@ -40,6 +47,178 @@ class AihubmixLargeLanguageModel(OAICompatLargeLanguageModel):
         credentials["extra_headers"] = {
             "APP-Code": "Dify2025"
         }
+
+    def _wrap_thinking_by_reasoning_content(
+        self, delta: dict, is_reasoning: bool
+    ) -> tuple[str, bool]:
+        """
+        If the reasoning response is from delta.get("reasoning") or delta.get("reasoning_content"),
+        we wrap it with HTML think tag.
+
+        :param delta: delta dictionary from LLM streaming response
+        :param is_reasoning: is reasoning
+        :return: tuple of (processed_content, is_reasoning)
+        """
+        content = delta.get("content") or ""
+        # Support both "reasoning" and "reasoning_content" field names for compatibility
+        reasoning_content = delta.get("reasoning") or delta.get("reasoning_content")
+
+        if reasoning_content:
+            if not is_reasoning:
+                content = "<think>\n" + reasoning_content
+                is_reasoning = True
+            else:
+                content = reasoning_content
+        elif is_reasoning and content:
+            content = "\n</think>" + content
+            is_reasoning = False
+        return content, is_reasoning
+
+    def _handle_generate_stream_response(
+        self,
+        model: str,
+        credentials: dict,
+        response: requests.Response,
+        prompt_messages: list[PromptMessage],
+    ) -> Generator:
+        """
+        Handle llm stream response with reasoning/thinking content support.
+
+        This method is based on openrouter's implementation to properly handle
+        the reasoning_content field returned by GPT-5 series and other reasoning models.
+
+        :param model: model name
+        :param credentials: model credentials
+        :param response: streamed response
+        :param prompt_messages: prompt messages
+        :return: llm response chunk generator
+        """
+        chunk_index = 0
+        full_assistant_content = ""
+        tools_calls: list[AssistantPromptMessage.ToolCall] = []
+        finish_reason = None
+        usage = None
+        is_reasoning_started = False
+
+        # delimiter for stream response, need unicode_escape
+        delimiter = credentials.get("stream_mode_delimiter", "\n\n")
+        delimiter = codecs.decode(delimiter, "unicode_escape")
+
+        for chunk in response.iter_lines(decode_unicode=True, delimiter=delimiter):
+            chunk = chunk.strip()
+            if chunk:
+                # ignore sse comments
+                if chunk.startswith(":"):
+                    continue
+                decoded_chunk = chunk.strip().removeprefix("data:").lstrip()
+                if decoded_chunk == "[DONE]":
+                    continue
+
+                try:
+                    chunk_json: dict = TypeAdapter(dict[str, Any]).validate_json(decoded_chunk)
+                except ValidationError:
+                    yield self._create_final_llm_result_chunk(
+                        index=chunk_index + 1,
+                        message=AssistantPromptMessage(content=""),
+                        finish_reason="Non-JSON encountered.",
+                        usage=usage,
+                        model=model,
+                        credentials=credentials,
+                        prompt_messages=prompt_messages,
+                        full_content=full_assistant_content,
+                    )
+                    break
+
+                # handle the error
+                if chunk_json.get("error") and chunk_json.get("choices") is None:
+                    raise ValueError(chunk_json.get("error"))
+
+                if chunk_json:
+                    if u := chunk_json.get("usage"):
+                        usage = u
+                if not chunk_json or len(chunk_json.get("choices", [])) == 0:
+                    continue
+
+                choice = chunk_json["choices"][0]
+                finish_reason = choice.get("finish_reason")
+                chunk_index += 1
+
+                if "delta" in choice:
+                    delta = choice["delta"]
+                    # Process reasoning content with _wrap_thinking_by_reasoning_content
+                    delta_content, is_reasoning_started = self._wrap_thinking_by_reasoning_content(
+                        delta, is_reasoning_started
+                    )
+
+                    assistant_message_tool_calls = None
+
+                    if (
+                        "tool_calls" in delta
+                        and credentials.get("function_calling_type", "no_call") == "tool_call"
+                    ):
+                        assistant_message_tool_calls = delta.get("tool_calls", None)
+                    elif (
+                        "function_call" in delta
+                        and credentials.get("function_calling_type", "no_call") == "function_call"
+                    ):
+                        assistant_message_tool_calls = [
+                            {
+                                "id": "tool_call_id",
+                                "type": "function",
+                                "function": delta.get("function_call", {}),
+                            }
+                        ]
+
+                    # extract tool calls from response
+                    if assistant_message_tool_calls:
+                        tool_calls = self._extract_response_tool_calls(assistant_message_tool_calls)
+                        _increase_tool_call(tool_calls, tools_calls)
+
+                    if not delta_content:
+                        continue
+
+                    # transform assistant message to prompt message
+                    assistant_prompt_message = AssistantPromptMessage(content=delta_content)
+                    full_assistant_content += delta_content
+
+                elif "text" in choice:
+                    choice_text = choice.get("text", "")
+                    if choice_text == "":
+                        continue
+
+                    assistant_prompt_message = AssistantPromptMessage(content=choice_text)
+                    full_assistant_content += choice_text
+                else:
+                    continue
+
+                yield LLMResultChunk(
+                    model=model,
+                    prompt_messages=prompt_messages,
+                    delta=LLMResultChunkDelta(index=chunk_index, message=assistant_prompt_message),
+                )
+
+            chunk_index += 1
+
+        if tools_calls:
+            yield LLMResultChunk(
+                model=model,
+                prompt_messages=prompt_messages,
+                delta=LLMResultChunkDelta(
+                    index=chunk_index,
+                    message=AssistantPromptMessage(tool_calls=tools_calls, content=""),
+                ),
+            )
+
+        yield self._create_final_llm_result_chunk(
+            index=chunk_index,
+            message=AssistantPromptMessage(content=""),
+            finish_reason=finish_reason,
+            usage=usage,
+            model=model,
+            credentials=credentials,
+            prompt_messages=prompt_messages,
+            full_content=full_assistant_content,
+        )
 
     def _prepare_model_parameters(
         self,
@@ -136,9 +315,18 @@ class AihubmixLargeLanguageModel(OAICompatLargeLanguageModel):
     ) -> Union[LLMResult, Generator]:
         try:
             self._update_credential(model, credentials)
+            
+            # 处理 enable_thinking 参数
             enable_thinking = model_parameters.pop("enable_thinking", None)
-            if enable_thinking is not None:
-                model_parameters["chat_template_kwargs"] = {"enable_thinking": bool(enable_thinking)}
+            
+            # 对于 RESPONSE_SERIES 模型，保留 enable_thinking 用于 Responses API
+            if model.startswith(RESPONSE_SERIES_COMPATIBILITY):
+                if enable_thinking is not None:
+                    model_parameters["_enable_thinking"] = bool(enable_thinking)
+            else:
+                # 对于其他模型，转换为 chat_template_kwargs
+                if enable_thinking is not None:
+                    model_parameters["chat_template_kwargs"] = {"enable_thinking": bool(enable_thinking)}
 
             # 将自定义的 enable_stream 参数映射到本地 stream 标志，避免把未知参数透传给上游
             enable_stream = model_parameters.pop("enable_stream", None)
